@@ -1,0 +1,7 @@
+test
+*.so
+faustffi_*
+
+__pycache__/
+*.py[cod]
+*$py.class
