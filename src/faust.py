@@ -2,37 +2,123 @@
 
 import cffi
 import collections
+import hashlib
 #import jack
 import os
 import re
 from subprocess import Popen, PIPE
 
-_faust_data_structures = open("/usr/share/faust/pure.c").read()
-_faust_data_structures = _faust_data_structures.replace("<<includeIntrinsic>>", "")
-_faust_data_structures = _faust_data_structures.replace("<<includeclass>>", "")
+FAUSTFLOAT = "double"
 
 class FaustCompilerError(Exception):
 	pass
+
+class FaustLib(object):
+	metadata = {}
+
+	_faust_data_structures = open("/usr/share/faust/pure.c").read()
+	_faust_data_structures = _faust_data_structures.replace("<<includeIntrinsic>>", "")
+	_faust_data_structures = _faust_data_structures.replace("<<includeclass>>", "")
+
+	_defs = """
+		typedef ... DSP;
+		DSP* newDSP();
+		void deleteDSP(DSP* dsp);
+		void metadataDSP(MetaGlue* m);
+		int getSampleRateDSP(DSP* dsp);
+		int getNumInputsDSP(DSP* dsp);
+		int getNumOutputsDSP(DSP* dsp);
+		void classInitDSP(int samplingFreq);
+		void instanceResetUserInterfaceDSP(DSP* dsp);
+		void instanceClearDSP(DSP* dsp);
+		void instanceConstantsDSP(DSP* dsp, int samplingFreq);
+		void instanceInitDSP(DSP* dsp, int samplingFreq);
+		void initDSP(DSP* dsp, int samplingFreq);
+		void buildUserInterfaceDSP(DSP* dsp, UIGlue* ui_interface);
+		void computeDSP(DSP* dsp, int count, FAUSTFLOAT** inputs, FAUSTFLOAT** outputs);
+	""".replace("FAUSTFLOAT", FAUSTFLOAT)
+
+	def __init__(self, dsp_src):
+		self.dsp_src = dsp_src
+		self.hash = hashlib.md5(self.dsp_src.encode("utf8")).hexdigest()[:8]
+
+		self._transpile()
+
+		self.c_src = "#define FAUSTFLOAT " + FAUSTFLOAT + "\n" + self.c_src
+		self.c_src = self._faust_data_structures + self.c_src
+
+		with open("faustffi_last.src.c", "w") as f:
+			f.write(self.c_src)
+
+		self.ffi = cffi.FFI()
+		self.ffi.cdef(self._cleanup_cpp(self._faust_data_structures))
+		self.ffi.cdef(self._defs)
+
+		self.ffi.set_source("faustffi_" + self.hash, self.c_src)
+
+		self.lib = self.ffi.dlopen(self.ffi.compile())
+		self._init_metadata()
+
+	def _transpile(self):
+		dsp_src = bytes(self.dsp_src, encoding="utf8")
+		with Popen(["faust", "-lang", "c", "/dev/stdin", "-cn", "DSP"], stdin=PIPE, stdout=PIPE, stderr=PIPE) as faust_compiler:
+			c_src, stderr = faust_compiler.communicate(input=dsp_src)
+
+		stderr = stderr.decode("utf8")
+		if stderr:
+			raise FaustCompilerError(stderr)
+
+		self.c_src = c_src.decode("utf8")
+
+	@staticmethod
+	def _cleanup_cpp(src):
+		sections = [
+			"#define FAUSTFLOAT (.*)",
+			"#include .*",
+			"#define .*",
+			"#ifdef .*",
+			"#ifndef .*",
+			"#endif.*",
+		]
+
+		for section in sections:
+			section = '\\s'.join(section.split())
+			src = re.sub(section, "", src, flags=re.MULTILINE)
+
+		src = src.replace("FAUSTFLOAT", FAUSTFLOAT)
+
+		return src
+
+	def _init_metadata(self):
+		@self.ffi.callback("metaDeclareFun")
+		def metaDeclare(_handle, key, value):
+			key = self.ffi.string(key).decode("utf8")
+			value = self.ffi.string(value).decode("utf8")
+			self.metadata[key] = value
+
+		metaglue = self.ffi.new("MetaGlue[1]")
+		metaglue[0].declare = metaDeclare
+		self.lib.metadataDSP(metaglue)
 
 ui_elements = {}
 def ui_element(cls):
 	field_name = "add%s" % cls.__name__
 	signature = "%sFun" % field_name
-	def wrap(dsp_instance):
+	def wrap(faust_instance):
 		def instanciate_element_at_callback(_interface, label, *args):
-			label = dsp_instance._ffi.string(label).decode("utf8")
+			label = faust_instance._ffi.string(label).decode("utf8")
 			element_instance = cls(label, *args)
 			if hasattr(element_instance, "__get__"):
 				# put it on the class, so it shows up as a property
-				setattr(dsp_instance.ui.__class__, label, element_instance)
+				setattr(faust_instance.ui.__class__, label, element_instance)
 			else:
 				# just throw it directly, so it won't turn into magic
-				setattr(dsp_instance.ui, label, element_instance)
-			dsp_instance.ui.elements[label] = element_instance
+				setattr(faust_instance.ui, label, element_instance)
+			faust_instance.ui.elements[label] = element_instance
 			element_instance.declarations = {}
 			print(repr(element_instance))
-		callback = dsp_instance._ffi.callback(signature, instanciate_element_at_callback)
-		dsp_instance.ui._callbacks.add(callback) #keep a reference or else we get segfault
+		callback = faust_instance._ffi.callback(signature, instanciate_element_at_callback)
+		faust_instance.ui._callbacks.add(callback) #keep a reference or else we get segfault
 		return callback
 	ui_elements[field_name] = wrap
 	return wrap
@@ -111,50 +197,40 @@ class NumEntry(Slider):
 				x += self.step
 		return "%s: [%s]" % (self.label, ', '.join(frange()))
 
-class FaustDSP(object):
-	FAUSTFLOAT = "double"
-	metadata = {}
-	declarations = {}
+class FaustInstance(object):
+	def __init__(self, faust_lib):
+		# link with the other class
+		self.faust_lib = faust_lib
+		self._ffi = self.faust_lib.ffi
+		self._lib = self.faust_lib.lib
 
-	def _transpile(self):
-		dsp_src = bytes(self.dsp_src, encoding="utf8")
-		with Popen(["faust", "-lang", "c", "/dev/stdin", "-cn", "DSP"], stdin=PIPE, stdout=PIPE, stderr=PIPE) as faust_compiler:
-			c_src, stderr = faust_compiler.communicate(input=dsp_src)
+		# init c structs and ui
+		self._struct = self._ffi.gc(self._lib.newDSP(), self._lib.deleteDSP)
+		self._lib.initDSP(self._struct, 48000)
+		self._init_ui()
 
-		stderr = stderr.decode("utf8")
-		if stderr:
-			raise FaustCompilerError(stderr)
+		# grab some info about the dsp
+		self.num_inputs = self._lib.getNumInputsDSP(self._struct)
+		self.num_outputs = self._lib.getNumOutputsDSP(self._struct)
 
-		self.c_src = c_src.decode("utf8")
-
-	def _cleanup_cpp(self, src):
-		sections = [
-			"#define FAUSTFLOAT (.*)",
-			"#include .*",
-			"#define .*",
-			"#ifdef .*",
-			"#ifndef .*",
-			"#endif.*",
+	def init_buffers(self, samples):
+		self.buffer_size = samples
+		self.input_buffers = [
+			self._ffi.new("%s[]" % FAUSTFLOAT, self.buffer_size)
+				for i in range(self.num_inputs)
+		]
+		self.output_buffers = [
+			self._ffi.new("%s[]" % FAUSTFLOAT, self.buffer_size)
+				for i in range(self.num_outputs)
 		]
 
-		for section in sections:
-			section = '\\s'.join(section.split())
-			src = re.sub(section, "", src, flags=re.MULTILINE)
+	def compute(self):
+		self._lib.computeDSP(self._struct, self.buffer_size, self.input_buffers, self.output_buffers)
+		#return list(self.output_buffers[0])
 
-		src = src.replace("FAUSTFLOAT", self.FAUSTFLOAT)
-
-		return src
-
-	def _init_metadata(self):
-		@self._ffi.callback("metaDeclareFun")
-		def metaDeclare(_handle, key, value):
-			key = self._ffi.string(key).decode("utf8")
-			value = self._ffi.string(value).decode("utf8")
-			self.metadata[key] = value
-
-		metaglue = self._ffi.new("MetaGlue[1]")
-		metaglue[0].declare = metaDeclare
-		self._lib.metadataDSP(metaglue)
+	@property
+	def samplerate(self):
+		return self._lib.getSampleRateDSP(self._struct)
 
 	def _init_ui(self):
 		# Prepare a class for the ui elements.
@@ -214,70 +290,6 @@ class FaustDSP(object):
 					del self.ui.declarations[zone]
 					self.ui.declarations[element] = per_zone_declarations
 
-	def __init__(self, dsp_src, name="mydsp"):
-		self.dsp_src = dsp_src
-		self.name = name
-
-		self._transpile()
-
-		self.c_src = "#define FAUSTFLOAT " + self.FAUSTFLOAT + "\n" + self.c_src
-		self.c_src = _faust_data_structures + self.c_src
-
-		with open("faustffi_" + self.name + ".src.c", "w") as f:
-			f.write(self.c_src)
-
-		self._ffi = cffi.FFI()
-		self._ffi.set_source("faustffi_" + self.name, self.c_src)
-		self._ffi.cdef(self._cleanup_cpp(_faust_data_structures))
-		self._ffi.cdef("""
-			typedef ... DSP;
-			DSP* newDSP();
-			void deleteDSP(DSP* dsp);
-			void metadataDSP(MetaGlue* m);
-			int getSampleRateDSP(DSP* dsp);
-			int getNumInputsDSP(DSP* dsp);
-			int getNumOutputsDSP(DSP* dsp);
-			int getInputRateDSP(DSP* dsp, int channel);
-			int getOutputRateDSP(DSP* dsp, int channel);
-			void classInitDSP(int samplingFreq);
-			void instanceResetUserInterfaceDSP(DSP* dsp);
-			void instanceClearDSP(DSP* dsp);
-			void instanceConstantsDSP(DSP* dsp, int samplingFreq);
-			void instanceInitDSP(DSP* dsp, int samplingFreq);
-			void initDSP(DSP* dsp, int samplingFreq);
-			void buildUserInterfaceDSP(DSP* dsp, UIGlue* ui_interface);
-			void computeDSP(DSP* dsp, int count, FAUSTFLOAT** inputs, FAUSTFLOAT** outputs);
-		""".replace("FAUSTFLOAT", self.FAUSTFLOAT))
-
-		self._lib = self._ffi.dlopen(self._ffi.compile())
-
-		self._struct = self._ffi.gc(self._lib.newDSP(), self._lib.deleteDSP)
-		self._init_metadata()
-		self._lib.initDSP(self._struct, 48000)
-		self._init_ui()
-
-		self.num_inputs = self._lib.getNumInputsDSP(self._struct)
-		self.num_outputs = self._lib.getNumOutputsDSP(self._struct)
-
-	def init_buffers(self, samples):
-		self.samples = samples
-		self.input_buffers = [
-			self._ffi.new("%s[]" % self.FAUSTFLOAT, self.samples)
-				for i in range(self.num_inputs)
-		]
-		self.output_buffers = [
-			self._ffi.new("%s[]" % self.FAUSTFLOAT, self.samples)
-				for i in range(self.num_outputs)
-		]
-
-	def compute(self):
-		self._lib.computeDSP(self._struct, self.samples, self.input_buffers, self.output_buffers)
-		#return list(self.output_buffers[0])
-
-	@property
-	def samplerate(self):
-		return self._lib.getSampleRateDSP(self._struct)
-
 if __name__=="__main__":
 	import pprint
 
@@ -285,19 +297,27 @@ if __name__=="__main__":
 		import("all.lib");
 		process = pm.guitar_ui_MIDI;
 	"""
-	self = FaustDSP(src, name="Main")
+	lib = FaustLib(src)
+	self = FaustInstance(lib)
+	self2 = FaustInstance(lib)
 	self.init_buffers(1024)
+	self2.init_buffers(1024)
 
 	def test_sound():
 		import soundcard
 		import threading
 		default_speaker = soundcard.default_speaker()
 		def worker():
-			with default_speaker.player(samplerate=self.samplerate, blocksize=self.samples) as player:
+			with default_speaker.player(samplerate=self.samplerate, blocksize=self.buffer_size) as player:
 				while True:
 					self.compute()
-					player.play(list(self.output_buffers[0]))
+					self2.compute()
+					l = self.output_buffers[0]
+					r = self2.output_buffers[0]
+					player.play(list(zip(list(l), list(r))))
 		t = threading.Thread(target=worker)
 		t.daemon = True
 		t.start()
+
 	test_sound()
+	#self.ui.gate();self2.ui.gate()
